@@ -1,0 +1,467 @@
+import React, { useMemo, useRef, useState } from "react";
+
+/**
+ * Expected CSV columns (flexible names):
+ * - Display Name (or Name)
+ * - Standard Name (or Field Name)
+ * - Element ID (or ElementID / ID)
+ * - Notes (optional)
+ *
+ * The app will:
+ * - index by Element ID
+ * - use FIRST row for display/search
+ * - export ALL rows for selected Element IDs
+ */
+
+function normalizeHeader(h) {
+  return String(h || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[\u2013\u2014]/g, "-");
+}
+
+function guessColumnMap(headers) {
+  const norm = headers.map(normalizeHeader);
+
+  const find = (...candidates) => {
+    for (const c of candidates) {
+      const idx = norm.indexOf(normalizeHeader(c));
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  };
+
+  const displayNameIdx = find("display name", "name", "friendly name");
+  const standardNameIdx = find("standard name", "field name", "eso field", "definition");
+  const elementIdIdx = find("element id", "elementid", "id", "element");
+  const notesIdx = find("notes", "status", "availability", "comment");
+
+  return { displayNameIdx, standardNameIdx, elementIdIdx, notesIdx };
+}
+
+/**
+ * Minimal CSV parser (handles quotes, commas, CRLF).
+ * Good for typical “exported spreadsheet” CSVs.
+ */
+function parseCSV(text) {
+  const rows = [];
+  let i = 0;
+  let field = "";
+  let row = [];
+  let inQuotes = false;
+
+  const pushField = () => {
+    row.push(field);
+    field = "";
+  };
+  const pushRow = () => {
+    // avoid pushing a trailing empty row from final newline
+    if (row.length === 1 && row[0] === "" && rows.length > 0) return;
+    rows.push(row);
+    row = [];
+  };
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        } else {
+          inQuotes = false;
+          i++;
+          continue;
+        }
+      } else {
+        field += ch;
+        i++;
+        continue;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+        i++;
+        continue;
+      }
+      if (ch === ",") {
+        pushField();
+        i++;
+        continue;
+      }
+      if (ch === "\n") {
+        pushField();
+        pushRow();
+        i++;
+        continue;
+      }
+      if (ch === "\r") {
+        // handle CRLF
+        if (text[i + 1] === "\n") {
+          pushField();
+          pushRow();
+          i += 2;
+          continue;
+        } else {
+          pushField();
+          pushRow();
+          i++;
+          continue;
+        }
+      }
+      field += ch;
+      i++;
+    }
+  }
+
+  // final field/row
+  pushField();
+  pushRow();
+  return rows;
+}
+
+function escapeCSV(value) {
+  const s = value == null ? "" : String(value);
+  // quote if contains comma, quote, or newline
+  if (/[,"\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function toCSV(headers, dataRows) {
+  const lines = [];
+  lines.push(headers.map(escapeCSV).join(","));
+  for (const r of dataRows) {
+    lines.push(r.map(escapeCSV).join(","));
+  }
+  return lines.join("\n");
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export default function App() {
+  const fileRef = useRef(null);
+
+  const [rawCSV, setRawCSV] = useState("");
+  const [headers, setHeaders] = useState([]);
+  const [rows, setRows] = useState([]); // array of arrays matching headers
+  const [colMap, setColMap] = useState(null);
+
+  const [query, setQuery] = useState("");
+  const [onlyWithElementId, setOnlyWithElementId] = useState(true);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+
+  const indexed = useMemo(() => {
+    if (!headers.length || !rows.length || !colMap) {
+      return {
+        elementMap: new Map(),
+        displayList: [],
+        missingIdRows: [],
+      };
+    }
+
+    const { displayNameIdx, standardNameIdx, elementIdIdx, notesIdx } = colMap;
+
+    const elementMap = new Map(); // elementId -> { firstRow, allRows: [] }
+    const missingIdRows = [];
+
+    for (const r of rows) {
+      const elementId = elementIdIdx >= 0 ? (r[elementIdIdx] || "").trim() : "";
+      if (!elementId) {
+        missingIdRows.push(r);
+        continue;
+      }
+      if (!elementMap.has(elementId)) {
+        elementMap.set(elementId, { firstRow: r, allRows: [r] });
+      } else {
+        elementMap.get(elementId).allRows.push(r);
+      }
+    }
+
+    // Build display list from FIRST row per elementId
+    const displayList = [];
+    for (const [elementId, bundle] of elementMap.entries()) {
+      const fr = bundle.firstRow;
+
+      const displayName = displayNameIdx >= 0 ? (fr[displayNameIdx] || "").trim() : "";
+      const standardName = standardNameIdx >= 0 ? (fr[standardNameIdx] || "").trim() : "";
+      const notes = notesIdx >= 0 ? (fr[notesIdx] || "").trim() : "";
+
+      displayList.push({
+        elementId,
+        displayName,
+        standardName,
+        notes,
+        variants: bundle.allRows.length,
+      });
+    }
+
+    // stable sort for usability
+    displayList.sort((a, b) => {
+      const dnA = (a.displayName || a.elementId).toLowerCase();
+      const dnB = (b.displayName || b.elementId).toLowerCase();
+      return dnA.localeCompare(dnB);
+    });
+
+    return { elementMap, displayList, missingIdRows };
+  }, [headers, rows, colMap]);
+
+  const filteredList = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return indexed.displayList;
+
+    return indexed.displayList.filter((item) => {
+      return (
+        item.elementId.toLowerCase().includes(q) ||
+        (item.displayName || "").toLowerCase().includes(q) ||
+        (item.standardName || "").toLowerCase().includes(q) ||
+        (item.notes || "").toLowerCase().includes(q)
+      );
+    });
+  }, [indexed.displayList, query]);
+
+  const selectedCount = selectedIds.size;
+
+  const selectedExportRows = useMemo(() => {
+    if (!colMap || !headers.length) return [];
+    const out = [];
+
+    for (const id of selectedIds) {
+      const bundle = indexed.elementMap.get(id);
+      if (!bundle) continue;
+      out.push(...bundle.allRows);
+    }
+
+    // Optional: include missing-id rows if user wants them
+    if (!onlyWithElementId) {
+      out.push(...indexed.missingIdRows);
+    }
+
+    return out;
+  }, [selectedIds, indexed.elementMap, indexed.missingIdRows, onlyWithElementId, colMap, headers]);
+
+  const onPickFile = async (file) => {
+    const text = await file.text();
+    setRawCSV(text);
+
+    const parsed = parseCSV(text);
+    if (!parsed.length) {
+      setHeaders([]);
+      setRows([]);
+      setColMap(null);
+      return;
+    }
+
+    const hdr = parsed[0].map((h) => String(h || "").trim());
+    const data = parsed.slice(1).filter((r) => r.some((c) => String(c || "").trim() !== ""));
+
+    setHeaders(hdr);
+    setRows(
+      data.map((r) => {
+        // pad to headers length
+        const rr = [...r];
+        while (rr.length < hdr.length) rr.push("");
+        return rr.slice(0, hdr.length);
+      })
+    );
+
+    const map = guessColumnMap(hdr);
+    setColMap(map);
+
+    // Clear selections when a new file loads
+    setSelectedIds(new Set());
+  };
+
+  const toggleSelect = (elementId) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(elementId)) next.delete(elementId);
+      else next.add(elementId);
+      return next;
+    });
+  };
+
+  const selectAllFiltered = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const item of filteredList) next.add(item.elementId);
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const exportSelected = () => {
+    if (!headers.length) return;
+    const csv = toCSV(headers, selectedExportRows);
+    const filename = `selected-data-dictionary-${new Date().toISOString().slice(0, 10)}.csv`;
+    downloadText(filename, csv);
+  };
+
+  const hasFile = headers.length > 0;
+
+  return (
+    <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif", padding: 16, maxWidth: 1100, margin: "0 auto" }}>
+      <h1 style={{ margin: "8px 0 4px" }}>Data Dictionary Selector</h1>
+      <p style={{ marginTop: 0, color: "#444" }}>
+        Upload your consolidated CSV. Select by <b>Element ID</b> (using the first occurrence as the display row), then export all matching rows.
+      </p>
+
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+        <button
+          onClick={() => fileRef.current?.click()}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white", cursor: "pointer" }}
+        >
+          Upload CSV
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".csv,text/csv"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onPickFile(f);
+            e.target.value = "";
+          }}
+        />
+
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search Display Name / Standard Name / Element ID / Notes…"
+          disabled={!hasFile}
+          style={{ flex: "1 1 420px", padding: "8px 10px", borderRadius: 8, border: "1px solid #ccc" }}
+        />
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8, userSelect: "none" }}>
+          <input
+            type="checkbox"
+            checked={onlyWithElementId}
+            disabled={!hasFile}
+            onChange={(e) => setOnlyWithElementId(e.target.checked)}
+          />
+          Only export rows with Element ID
+        </label>
+
+        <button
+          onClick={selectAllFiltered}
+          disabled={!hasFile || filteredList.length === 0}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white", cursor: "pointer" }}
+        >
+          Select all (filtered)
+        </button>
+
+        <button
+          onClick={clearSelection}
+          disabled={!hasFile || selectedCount === 0}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white", cursor: "pointer" }}
+        >
+          Clear selection
+        </button>
+
+        <button
+          onClick={exportSelected}
+          disabled={!hasFile || selectedCount === 0}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #1a73e8",
+            background: selectedCount ? "#1a73e8" : "#eee",
+            color: selectedCount ? "white" : "#888",
+            cursor: selectedCount ? "pointer" : "not-allowed",
+          }}
+        >
+          Download CSV ({selectedCount})
+        </button>
+      </div>
+
+      {!hasFile ? (
+        <div style={{ border: "1px dashed #bbb", borderRadius: 12, padding: 16, color: "#555" }}>
+          <b>Upload a CSV</b> containing your consolidated data dictionary.
+          <div style={{ marginTop: 8, fontSize: 13 }}>
+            Tip: make sure you have a column named <code>Element ID</code> (or similar).
+          </div>
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", margin: "10px 0" }}>
+            <div style={{ color: "#333" }}>
+              Showing <b>{filteredList.length.toLocaleString()}</b> element IDs (unique){" "}
+              {indexed.missingIdRows.length ? (
+                <span style={{ color: "#777" }}>
+                  · Missing Element ID rows: <b>{indexed.missingIdRows.length.toLocaleString()}</b>
+                </span>
+              ) : null}
+            </div>
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 12, overflow: "hidden" }}>
+            <div style={{ background: "#fafafa", borderBottom: "1px solid #eee", padding: "10px 12px", fontWeight: 600 }}>
+              Select by first-reported Element ID (exports all variants)
+            </div>
+
+            <div style={{ maxHeight: 600, overflow: "auto" }}>
+              {filteredList.map((item) => {
+                const checked = selectedIds.has(item.elementId);
+                return (
+                  <div
+                    key={item.elementId}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "34px 180px 1fr 1fr 120px",
+                      gap: 10,
+                      padding: "10px 12px",
+                      borderBottom: "1px solid #f1f1f1",
+                      alignItems: "center",
+                      background: checked ? "#f3f8ff" : "white",
+                    }}
+                  >
+                    <input type="checkbox" checked={checked} onChange={() => toggleSelect(item.elementId)} />
+
+                    <div style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", fontSize: 13 }}>
+                      {item.elementId}
+                    </div>
+
+                    <div>
+                      <div style={{ fontWeight: 600, color: "#222" }}>{item.displayName || <span style={{ color: "#777" }}>(No Display Name)</span>}</div>
+                      {item.standardName ? <div style={{ fontSize: 13, color: "#555" }}>{item.standardName}</div> : null}
+                    </div>
+
+                    <div style={{ fontSize: 13, color: "#555" }}>{item.notes || ""}</div>
+
+                    <div style={{ fontSize: 12, color: "#555", textAlign: "right" }}>
+                      {item.variants > 1 ? (
+                        <span title="Number of rows with this Element ID">Variants: {item.variants}</span>
+                      ) : (
+                        <span title="Exactly one row for this Element ID">Variant: 1</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {filteredList.length === 0 ? (
+                <div style={{ padding: 14, color: "#666" }}>No matches.</div>
+              ) : null}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
